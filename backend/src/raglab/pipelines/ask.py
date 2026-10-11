@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Sequence
+import logging
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 
-from raglab.core.prompts import answer_prompt, citations
+from raglab.core.prompts import answer_prompt, citations, parse_rewrite, rewrite_prompt
 from raglab.core.retrieval import fuse_rrf, within_budget
 from raglab.core.text import or_tsquery
 from raglab.domain import Citation, Hit, Restart, Turn
+from raglab.pipelines.concurrency import complete
 from raglab.ports import Embedder, Generator, TextSearch, VectorSearch
+
+log = logging.getLogger(__name__)
+
+type Search = Callable[[str], Awaitable[tuple[Hit, ...]]]
 
 NO_SOURCES = "I couldn't find anything about that in your documents."
 
@@ -35,6 +41,22 @@ async def hybrid_search(
         )
     rankings = [by_meaning.result()] + ([by_words.result()] if by_words else [])
     return fuse_rrf(rankings, limit=k)
+
+
+async def standalone_question(
+    question: str, history: Sequence[Turn], generator: Generator, *, time_limit: float = 60
+) -> str:
+    """A follow-up ("why does it do that?") searched as-is finds the wrong passages, so the
+    model first rewrites it from the conversation. Any failure keeps the question as asked."""
+    if not history:
+        return question
+    try:
+        async with asyncio.timeout(time_limit):
+            text = await complete(generator.stream, rewrite_prompt(question, history))
+    except Exception as exc:
+        log.warning("could not rewrite the follow-up question: %s", exc)
+        return question
+    return parse_rewrite(text, fallback=question)
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,3 +108,20 @@ async def ask(
         yield Delta(delta)
     answer = "".join(parts)
     yield Done(answer, citations(answer, selected))
+
+
+async def answer(
+    question: str,
+    *,
+    search: Search,
+    generator: Generator,
+    history: Sequence[Turn] = (),
+) -> AsyncIterator[AskEvent]:
+    """Rewrite a follow-up into a standalone query, search with it, then answer the
+    question as asked, with the conversation in the prompt."""
+    query = await standalone_question(question, history, generator)
+    if query != question:
+        log.info("follow-up %r searched as %r", question, query)
+    hits = await search(query)
+    async for event in ask(question, hits, generator=generator, history=history):
+        yield event

@@ -3,7 +3,9 @@ from raglab.core.prompts import (
     citations,
     extract_json,
     parse_contexts,
+    parse_rewrite,
     parse_transcription,
+    rewrite_prompt,
 )
 from raglab.domain import Hit, Page, Turn
 
@@ -46,3 +48,20 @@ def test_parse_transcription_sorts_pages_and_skips_bad_items() -> None:
 def test_history_drops_old_citation_markers() -> None:
     prompt = answer_prompt("And instant?", hits(), [Turn("assistant", "Card: 180 days [1][2].")])
     assert "Assistant: Card: 180 days." in prompt.user
+
+
+def test_rewrite_prompt_carries_the_conversation_and_the_follow_up() -> None:
+    prompt = rewrite_prompt("Why?", [Turn("user", "What is Shameless Green?")])
+    assert "User: What is Shameless Green?" in prompt.user
+    assert prompt.user.endswith("Follow-up question: Why?")
+
+
+def test_parse_rewrite_takes_the_first_line_without_labels_or_quotes() -> None:
+    assert parse_rewrite('\nQuestion: "Why recommend Shameless Green?"\nextra', fallback="x") == (
+        "Why recommend Shameless Green?"
+    )
+
+
+def test_parse_rewrite_falls_back_on_empty_or_runaway_output() -> None:
+    assert parse_rewrite("  \n ", fallback="Why?") == "Why?"
+    assert parse_rewrite("a" * 600, fallback="Why?") == "Why?"

@@ -3,9 +3,29 @@ from collections.abc import AsyncIterator, Sequence
 
 import pytest
 
-from raglab.domain import RESTART, ChunkConfig, Hit, Page, Prompt, RawDocument, Restart, Vector
-from raglab.pipelines.ask import NO_SOURCES, Delta, Done, Reset, Sources, ask, hybrid_search
-from raglab.pipelines.concurrency import map_batched
+from raglab.domain import (
+    RESTART,
+    ChunkConfig,
+    Hit,
+    Page,
+    Prompt,
+    RawDocument,
+    Restart,
+    Turn,
+    Vector,
+)
+from raglab.pipelines.ask import (
+    NO_SOURCES,
+    Delta,
+    Done,
+    Reset,
+    Sources,
+    answer,
+    ask,
+    hybrid_search,
+    standalone_question,
+)
+from raglab.pipelines.concurrency import guarded, map_batched
 from raglab.pipelines.ingest import IngestError, ingest
 from raglab.ports import Generator, IngestOptions
 from tests.fakes import (
@@ -173,3 +193,72 @@ async def test_ask_discards_text_when_the_model_restarts() -> None:
     assert sum(isinstance(e, Reset) for e in events) == 1  # the first restart had no text
     done = events[-1]
     assert isinstance(done, Done) and done.answer == "Up to 180 days [1]."
+
+
+HISTORY = (Turn("user", "What is Shameless Green?"), Turn("assistant", "A simple solution."))
+
+
+async def test_follow_ups_are_searched_as_standalone_questions() -> None:
+    generator, prompts = scripted_generator(
+        "Why does the author recommend Shameless Green?", "Because it is simple [1]."
+    )
+    searched: list[str] = []
+
+    async def search(query: str) -> tuple[Hit, ...]:
+        searched.append(query)
+        return (_hit(1),)
+
+    events = [
+        e
+        async for e in answer(
+            "Why recommend it?", search=search, generator=generator, history=HISTORY
+        )
+    ]
+    assert searched == ["Why does the author recommend Shameless Green?"]
+    assert "Question: Why recommend it?" in prompts[1].user  # answered as asked
+    assert isinstance(events[-1], Done)
+
+
+async def test_first_questions_are_searched_without_a_model_call() -> None:
+    assert await standalone_question("Why?", (), failing_generator()) == "Why?"
+
+
+async def test_a_failed_rewrite_keeps_the_question_as_asked() -> None:
+    assert await standalone_question("Why?", HISTORY, failing_generator()) == "Why?"
+
+
+async def test_guarded_returns_the_work_result_and_stops_the_guard() -> None:
+    guard_stopped = asyncio.Event()
+
+    async def guard() -> None:
+        try:
+            await asyncio.sleep(60)
+        finally:
+            guard_stopped.set()
+
+    assert await guarded(asyncio.sleep(0, "done"), guard(), lost=lambda: RuntimeError()) == "done"
+    assert guard_stopped.is_set()
+
+
+async def test_guarded_cancels_the_work_when_the_guard_returns() -> None:
+    work_cancelled = asyncio.Event()
+
+    async def work() -> str:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            work_cancelled.set()
+            raise
+        return "unreachable"
+
+    with pytest.raises(LookupError):
+        await guarded(work(), asyncio.sleep(0.01), lost=lambda: LookupError("lost"))
+    assert work_cancelled.is_set()
+
+
+async def test_guarded_raises_the_guards_error() -> None:
+    async def broken_guard() -> None:
+        raise ConnectionError("db down")
+
+    with pytest.raises(ConnectionError):
+        await guarded(asyncio.sleep(60), broken_guard(), lost=lambda: LookupError())

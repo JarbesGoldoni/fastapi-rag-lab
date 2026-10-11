@@ -70,6 +70,8 @@ jobs = Table(
     Column("options", JSONB, nullable=False, server_default="{}"),
     Column("status", String(16), nullable=False, server_default="pending"),
     Column("attempts", Integer, nullable=False, server_default="0"),
+    Column("worker_id", Text),  # who runs it, while running
+    Column("lease_until", DateTime(timezone=True)),  # renewed by the worker's heartbeat
     Column("error", Text),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     Column("updated_at", DateTime(timezone=True), nullable=False, server_default=func.now()),

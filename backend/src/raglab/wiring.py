@@ -1,24 +1,35 @@
-"""The composition root: the one place that picks adapters and binds them into pipelines."""
+"""The composition root: picks adapters once and binds them into the application's use cases.
+
+Routes and the worker talk to the Container only; nothing outside db/ and wiring touches
+the engine.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import functools
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from raglab.adapters.embeddings import local_embedder, openai_embedder
 from raglab.adapters.pdf import pymupdf_extractor
 from raglab.adapters.registry import Providers, discover
-from raglab.db.repository import make_save_chunks, make_text_search, make_vector_search
-from raglab.domain import Hit, IngestResult, RawDocument
-from raglab.pipelines.ask import hybrid_search
+from raglab.core.prompts import answer_prompt, parse_rewrite
+from raglab.core.retrieval import within_budget
+from raglab.db import repository as repo
+from raglab.db.repository import DocumentRow, Job
+from raglab.db.schema import EMBEDDING_DIMENSIONS
+from raglab.domain import Hit, IngestResult, Prompt, RawDocument, Turn
+from raglab.pipelines.ask import AskEvent, answer, hybrid_search
 from raglab.pipelines.concurrency import ignore_progress
 from raglab.pipelines.ingest import ingest
-from raglab.ports import Embedder, IngestOptions, Report
+from raglab.ports import Embedder, Generator, IngestOptions, Report
 from raglab.settings import Settings
+
+BROWSER_CONTEXT_CHARS = 4_000  # Gemini Nano has a small context window
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,32 +39,45 @@ class Container:
     embedder: Embedder
     providers: Providers
 
+    # ------------------------------------------------------------ documents
+
+    async def add_document(
+        self, doc: RawDocument, options: dict[str, Any]
+    ) -> tuple[DocumentRow, bool]:
+        return await repo.create_document(self.engine, doc, options)
+
+    async def list_documents(self) -> list[DocumentRow]:
+        return await repo.list_documents(self.engine)
+
+    async def get_document(self, document_id: str) -> DocumentRow | None:
+        return await repo.get_document(self.engine, document_id)
+
+    async def get_file(self, document_id: str) -> RawDocument | None:
+        return await repo.get_raw_document(self.engine, document_id)
+
+    async def reprocess(self, document_id: str, options: dict[str, Any]) -> DocumentRow | None:
+        if await repo.get_document(self.engine, document_id) is None:
+            return None
+        await repo.requeue(self.engine, document_id, options)
+        return await repo.get_document(self.engine, document_id)
+
+    async def delete_document(self, document_id: str) -> bool:
+        return await repo.delete_document(self.engine, document_id)
+
     async def ingest(
         self,
         doc: RawDocument,
         options: IngestOptions,
         report: Report = ignore_progress,
-        job_id: int | None = None,
+        job: Job | None = None,
     ) -> IngestResult:
         return await ingest(
             doc,
             options,
             extractor=pymupdf_extractor,
             embedder=self.embedder,
-            save=make_save_chunks(self.engine, job_id),
+            save=repo.make_save_chunks(self.engine, job),
             report=report,
-        )
-
-    async def search(
-        self, query: str, *, k: int = 6, document_ids: Sequence[str] | None = None
-    ) -> tuple[Hit, ...]:
-        return await hybrid_search(
-            query,
-            embedder=self.embedder,
-            vector_search=make_vector_search(self.engine, self.embedder.model),
-            text_search=make_text_search(self.engine),
-            k=k,
-            document_ids=document_ids,
         )
 
     def ingest_options(self, raw: dict[str, object]) -> IngestOptions:
@@ -65,6 +89,54 @@ class Container:
             ai_extractor=transcribers.get(extract_id) if isinstance(extract_id, str) else None,
         )
 
+    # ------------------------------------------------------------ questions
+
+    async def search(
+        self, query: str, *, k: int = 6, document_ids: Sequence[str] | None = None
+    ) -> tuple[Hit, ...]:
+        return await hybrid_search(
+            query,
+            embedder=self.embedder,
+            vector_search=repo.make_vector_search(self.engine, self.embedder.model),
+            text_search=repo.make_text_search(self.engine),
+            k=k,
+            document_ids=document_ids,
+        )
+
+    def answer(
+        self,
+        question: str,
+        *,
+        generator: Generator,
+        history: Sequence[Turn] = (),
+        k: int = 6,
+        document_ids: Sequence[str] | None = None,
+    ) -> AsyncIterator[AskEvent]:
+        return answer(
+            question,
+            search=functools.partial(self.search, k=k, document_ids=document_ids),
+            generator=generator,
+            history=history,
+        )
+
+    async def browser_context(
+        self,
+        question: str,
+        *,
+        rewritten: str | None = None,
+        history: Sequence[Turn] = (),
+        k: int = 6,
+        document_ids: Sequence[str] | None = None,
+    ) -> tuple[tuple[Hit, ...], Prompt]:
+        """Sources and prompt for a model that runs in the browser. The browser rewrites
+        follow-ups itself and sends the raw rewrite."""
+        query = parse_rewrite(rewritten, fallback=question) if rewritten else question
+        hits = within_budget(
+            await self.search(query, k=k, document_ids=document_ids),
+            max_chars=BROWSER_CONTEXT_CHARS,
+        )
+        return hits, answer_prompt(question, hits, history)
+
 
 def make_embedder(settings: Settings) -> Embedder:
     if settings.embedding_provider == "openai":
@@ -73,7 +145,7 @@ def make_embedder(settings: Settings) -> Embedder:
         return openai_embedder(
             settings.openai_api_key.get_secret_value(),
             settings.openai_embedding_model,
-            settings.embedding_dimensions,
+            EMBEDDING_DIMENSIONS,
         )
     return local_embedder(settings.local_embedding_model)
 
@@ -81,10 +153,10 @@ def make_embedder(settings: Settings) -> Embedder:
 async def build(settings: Settings, *, embedder: Embedder | None = None) -> Container:
     engine = create_async_engine(settings.database_url, pool_size=10, max_overflow=5)
     chosen = embedder or await asyncio.to_thread(functools.partial(make_embedder, settings))
-    if chosen.dimensions != settings.embedding_dimensions:
+    if chosen.dimensions != EMBEDDING_DIMENSIONS:
         raise RuntimeError(
             f"{chosen.model} produces {chosen.dimensions}-dim vectors; "
-            f"the schema expects {settings.embedding_dimensions}"
+            f"the database schema stores {EMBEDDING_DIMENSIONS}"
         )
     return Container(
         settings=settings, engine=engine, embedder=chosen, providers=discover(settings)

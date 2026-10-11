@@ -41,12 +41,26 @@ export interface AskBody {
   document_ids: string[] | null;
 }
 
-export const getContext = (body: AskBody) =>
-  fetch("/api/context", {
+const post = (path: string, body: unknown, signal?: AbortSignal) =>
+  fetch(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-  }).then(json<{ hits: Hit[]; system: string; user: string }>);
+    signal,
+  });
+
+export interface PromptParts {
+  system: string;
+  user: string;
+}
+
+/** For browser models: the prompt that turns a follow-up into a standalone search query. */
+export const getRewritePrompt = (body: { query: string; history: Turn[] }) =>
+  post("/api/rewrite-prompt", body).then(json<PromptParts>);
+
+/** Sources and the answer prompt; `rewritten` is the browser model's raw rewrite, if any. */
+export const getContext = (body: AskBody & { rewritten?: string }) =>
+  post("/api/context", body).then(json<PromptParts & { hits: Hit[] }>);
 
 /** POST /api/ask and deliver each server-sent event as it arrives. */
 export async function askStream(
@@ -54,12 +68,7 @@ export async function askStream(
   onEvent: (event: AskEvent) => void,
   signal: AbortSignal,
 ): Promise<void> {
-  const response = await fetch("/api/ask", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal,
-  });
+  const response = await post("/api/ask", body, signal);
   if (!response.ok || !response.body) {
     await json(response);
     return;

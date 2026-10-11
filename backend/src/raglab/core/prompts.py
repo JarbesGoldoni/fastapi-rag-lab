@@ -23,6 +23,11 @@ TRANSCRIBE_SYSTEM = """You transcribe PDF documents. Return only a JSON array of
 {"page": <1-based page number>, "text": "<all readable text on that page>"}. Keep the
 original language. No commentary."""
 
+REWRITE_SYSTEM = """You turn a follow-up question into a standalone search query.
+Replace pronouns and references ("it", "that chapter", "the second one") with what they refer
+to in the conversation. If the question already stands on its own, return it unchanged.
+Return only the question, in its original language, on one line."""
+
 _CITATION = re.compile(r"\[(\d{1,3})\]")
 
 
@@ -48,6 +53,19 @@ def answer_prompt(question: str, hits: Sequence[Hit], history: Sequence[Turn] = 
         parts.append(f"Conversation so far:\n{format_history(history)}")
     parts.append(f"Question: {question}")
     return Prompt(system=ANSWER_SYSTEM, user="\n\n---\n\n".join(parts))
+
+
+def rewrite_prompt(question: str, history: Sequence[Turn]) -> Prompt:
+    user = f"Conversation:\n{format_history(history)}\n\n---\n\nFollow-up question: {question}"
+    return Prompt(system=REWRITE_SYSTEM, user=user)
+
+
+def parse_rewrite(text: str, *, fallback: str, max_chars: int = 500) -> str:
+    """The first non-empty line, without quotes or a label; the fallback if that is unusable."""
+    line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    line = re.sub(r"^(standalone )?(question|query)\s*:\s*", "", line, flags=re.IGNORECASE)
+    line = line.strip().strip("\"'“”").strip()
+    return line if 0 < len(line) <= max_chars else fallback
 
 
 def context_prompt(document_excerpt: str, chunks: Sequence[Chunk], *, preview: int = 400) -> Prompt:

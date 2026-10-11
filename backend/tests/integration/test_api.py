@@ -48,7 +48,12 @@ async def client() -> AsyncIterator[httpx.AsyncClient]:
     await engine.dispose()
 
     generator, _ = scripted_generator("Within thirty days [1].", id="fake")
-    settings = Settings(database_url=DATABASE_URL, worker_poll_seconds=0.05, cors_origins=[])
+    settings = Settings(
+        database_url=DATABASE_URL,
+        worker_poll_seconds=0.05,
+        cors_origins=["http://localhost:5173"],
+        allowed_hosts=["test"],
+    )
 
     async def build_container(s: Settings) -> Container:
         container = await build(s, embedder=hash_embedder)
@@ -170,7 +175,7 @@ async def test_a_deleted_documents_job_cannot_write_to_its_reupload() -> None:
             await conn.execute(text("TRUNCATE documents, chunks, jobs RESTART IDENTITY CASCADE"))
         doc = RawDocument("same-id", "a.pdf", b"%PDF-1")
         await repo.create_document(engine, doc, {})
-        old_job = await repo.claim_job(engine)
+        old_job = await repo.claim_job(engine, "w1", lease_seconds=30)
         assert old_job is not None
 
         await repo.delete_document(engine, doc.id)
@@ -178,7 +183,7 @@ async def test_a_deleted_documents_job_cannot_write_to_its_reupload() -> None:
 
         with pytest.raises(repo.JobCancelled):
             await repo.set_progress(engine, old_job, Progress(Stage.EMBEDDING, 5, 10))
-        save = repo.make_save_chunks(engine, old_job.id)
+        save = repo.make_save_chunks(engine, old_job)
         with pytest.raises(repo.JobCancelled):
             await save(doc.id, [Chunk(doc.id, 0, 1, "x")], [tuple([0.0] * 384)], "m")
         await repo.finish_job(engine, old_job, error=None, document_fields={"pages": 99})
@@ -201,12 +206,195 @@ async def test_requeue_cancels_the_running_job() -> None:
             await conn.execute(text("TRUNCATE documents, chunks, jobs RESTART IDENTITY CASCADE"))
         doc = RawDocument("doc", "a.pdf", b"%PDF-1")
         await repo.create_document(engine, doc, {})
-        running = await repo.claim_job(engine)
+        running = await repo.claim_job(engine, "w1", lease_seconds=30)
         assert running is not None
         await repo.requeue(engine, doc.id, {})
         with pytest.raises(repo.JobCancelled):
             await repo.set_progress(engine, running, Progress(Stage.READING, 1, 2))
-        fresh = await repo.claim_job(engine)
+        fresh = await repo.claim_job(engine, "w1", lease_seconds=30)
         assert fresh is not None and fresh.id != running.id
     finally:
         await engine.dispose()
+
+
+# ---------------------------------------------------------------- queue and worker
+
+
+async def fresh_container(**overrides: Any) -> Container:
+    assert DATABASE_URL
+    container = await build(
+        Settings(database_url=DATABASE_URL, worker_poll_seconds=0.05, **overrides),
+        embedder=hash_embedder,
+    )
+    async with container.engine.begin() as conn:
+        await conn.execute(text("TRUNCATE documents, chunks, jobs RESTART IDENTITY CASCADE"))
+    return container
+
+
+async def test_a_live_lease_is_not_taken_over_by_another_worker() -> None:
+    from raglab.db import repository as repo
+    from raglab.domain import RawDocument
+
+    c = await fresh_container()
+    try:
+        await repo.create_document(c.engine, RawDocument("d", "a.pdf", b"%PDF-1"), {})
+        assert await repo.claim_job(c.engine, "a", lease_seconds=30)
+        assert await repo.recover_expired_jobs(c.engine, max_attempts=3) == 0
+        assert await repo.claim_job(c.engine, "b", lease_seconds=30) is None
+    finally:
+        await c.engine.dispose()
+
+
+async def test_an_expired_lease_moves_the_job_and_locks_out_the_old_worker() -> None:
+    from raglab.db import repository as repo
+    from raglab.domain import Progress, RawDocument, Stage
+
+    c = await fresh_container()
+    try:
+        await repo.create_document(c.engine, RawDocument("d", "a.pdf", b"%PDF-1"), {})
+        stalled = await repo.claim_job(c.engine, "a", lease_seconds=0)
+        assert stalled is not None
+        assert await repo.recover_expired_jobs(c.engine, max_attempts=3) == 1
+        taken = await repo.claim_job(c.engine, "b", lease_seconds=30)
+        assert taken is not None and taken.id == stalled.id and taken.attempts == 2
+
+        assert not await repo.renew_lease(c.engine, stalled, lease_seconds=30)
+        with pytest.raises(repo.JobCancelled):
+            await repo.set_progress(c.engine, stalled, Progress(Stage.READING, 1, 2))
+        await repo.set_progress(c.engine, taken, Progress(Stage.READING, 1, 2))
+    finally:
+        await c.engine.dispose()
+
+
+async def test_a_job_that_keeps_stopping_its_worker_fails_after_max_attempts() -> None:
+    from raglab.db import repository as repo
+    from raglab.domain import RawDocument
+
+    c = await fresh_container()
+    try:
+        await repo.create_document(c.engine, RawDocument("d", "a.pdf", b"%PDF-1"), {})
+        for _ in range(2):
+            assert await repo.claim_job(c.engine, "w", lease_seconds=0)
+            await repo.recover_expired_jobs(c.engine, max_attempts=2)
+        row = await repo.get_document(c.engine, "d")
+        assert row is not None and row.status == "failed" and "not retrying" in (row.error or "")
+        assert await repo.claim_job(c.engine, "w", lease_seconds=30) is None
+    finally:
+        await c.engine.dispose()
+
+
+async def test_deleting_a_document_stops_a_running_model_call_within_a_heartbeat() -> None:
+    from raglab import worker
+    from raglab.db import repository as repo
+    from raglab.domain import Prompt, RawDocument
+    from raglab.ports import Generator
+
+    c = await fresh_container(worker_heartbeat_seconds=0.05)
+    cancelled = asyncio.Event()
+
+    async def slow(_: Prompt) -> AsyncIterator[str]:
+        try:
+            await asyncio.sleep(30)  # one long CLI call
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        yield "never"
+
+    c = dataclasses.replace(
+        c,
+        providers=Providers(
+            generators={"slow": Generator(id="slow", label="S", kind="cli", stream=slow)},
+            transcribers={},
+        ),
+    )
+    try:
+        doc = RawDocument("d", "a.pdf", make_pdf(HANDBOOK))
+        await repo.create_document(c.engine, doc, {"contextualize_with": "slow"})
+        job = await repo.claim_job(c.engine, "w", lease_seconds=30)
+        assert job is not None
+        task = asyncio.create_task(worker.process(c, job))
+        await asyncio.sleep(0.3)
+        await repo.delete_document(c.engine, doc.id)
+        async with asyncio.timeout(2):
+            await task
+        assert cancelled.is_set()
+    finally:
+        await c.engine.dispose()
+
+
+async def test_the_worker_keeps_going_after_a_job_fails_outside_ingestion() -> None:
+    from raglab import worker
+    from raglab.db import repository as repo
+    from raglab.domain import RawDocument
+
+    c = await fresh_container()
+    handled: list[str] = []
+    both = asyncio.Event()
+
+    async def handle(_: Container, job: repo.Job) -> None:
+        handled.append(job.document_id)
+        if len(handled) == 2:
+            both.set()
+        if job.document_id == "first":
+            raise ConnectionError("database connection lost")
+
+    try:
+        for name in ("first", "second"):
+            await repo.create_document(c.engine, RawDocument(name, "a.pdf", b"%PDF-1"), {})
+        stop = asyncio.Event()
+        task = asyncio.create_task(worker.run(c, stop, handle=handle, worker="w"))
+        async with asyncio.timeout(5):
+            await both.wait()
+        assert handled == ["first", "second"]
+        assert not task.done()
+        stop.set()
+        await task
+    finally:
+        await c.engine.dispose()
+
+
+async def test_documents_embedded_with_another_model_are_ingested_again() -> None:
+    from raglab.db import repository as repo
+    from raglab.domain import Chunk, RawDocument
+
+    c = await fresh_container()
+    try:
+        await repo.create_document(c.engine, RawDocument("d", "a.pdf", b"%PDF-1"), {"k": "v"})
+        job = await repo.claim_job(c.engine, "w", lease_seconds=30)
+        assert job is not None
+        save = repo.make_save_chunks(c.engine, job)
+        await save("d", [Chunk("d", 0, 1, "x")], [tuple([0.1] * 384)], "old-model")
+        await repo.finish_job(c.engine, job, error=None, document_fields={})
+
+        assert await repo.requeue_stale_embeddings(c.engine, "old-model") == 0
+        assert await repo.requeue_stale_embeddings(c.engine, "new-model") == 1
+        again = await repo.claim_job(c.engine, "w", lease_seconds=30)
+        assert again is not None and again.options == {"k": "v"}
+    finally:
+        await c.engine.dispose()
+
+
+# ---------------------------------------------------------------- browser protection
+
+
+async def test_cross_origin_writes_and_foreign_hosts_are_refused(
+    client: httpx.AsyncClient,
+) -> None:
+    files = {"file": ("a.pdf", make_pdf(HANDBOOK), "application/pdf")}
+    foreign = await client.post(
+        "/api/documents", files=files, headers={"Origin": "https://evil.example"}
+    )
+    assert foreign.status_code == 403
+    assert (await client.get("/api/documents")).json() == []
+
+    listed = await client.post(
+        "/api/documents", files=files, headers={"Origin": "http://localhost:5173"}
+    )
+    assert listed.status_code == 202
+
+    rebound = await client.get("/api/documents", headers={"Host": "evil.example"})
+    assert rebound.status_code == 400
+
+
+async def test_health_reports_the_embedded_worker(client: httpx.AsyncClient) -> None:
+    assert (await client.get("/api/health")).json() == {"status": "ok", "worker": "running"}

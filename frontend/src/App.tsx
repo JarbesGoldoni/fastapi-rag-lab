@@ -1,29 +1,22 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Composer } from "./components/Composer";
 import { SpeakerIcon } from "./components/Icons";
 import { MessageView } from "./components/Message";
 import { Sidebar } from "./components/Sidebar";
+import { useChat } from "./hooks/useChat";
+import { useDictation } from "./hooks/useDictation";
+import { useDocuments } from "./hooks/useDocuments";
+import { useSpeech } from "./hooks/useSpeech";
 import * as api from "./lib/api";
-import { chatReducer, historyOf } from "./lib/chat";
-import { citationsOf } from "./lib/citations";
-import { nanoAvailability, nanoStream } from "./lib/nano";
-import { takeSentences } from "./lib/sentences";
-import type { AskEvent, DocumentInfo, Provider, Providers } from "./lib/types";
-import { createPlayer, decodeToMono16k, startRecording, type Recorder } from "./voice/audio";
-import { useVoiceModel } from "./voice/useVoiceModel";
+import { nanoAvailability } from "./lib/nano";
+import type { Provider, Providers } from "./lib/types";
 
 const NANO: Provider = { id: "chrome-nano", label: "Gemini Nano (in Chrome)", kind: "browser" };
-const VOICE = "af_heart";
 const SUGGESTIONS = [
   "When is the on-call week handed over?",
   "How long can a card payment be refunded?",
   "What happens if I exceed the rate limit?",
 ];
-
-const createStt = () =>
-  new Worker(new URL("./voice/stt.worker.ts", import.meta.url), { type: "module" });
-const createTts = () =>
-  new Worker(new URL("./voice/tts.worker.ts", import.meta.url), { type: "module" });
 
 const remember = (key: string, value: string) => {
   try {
@@ -44,33 +37,24 @@ export default function App() {
   const [providers, setProviders] = useState<Providers | null>(null);
   const [nano, setNano] = useState(false);
   const [provider, setProvider] = useState<string>(recall("provider") ?? "");
-  const [documents, setDocuments] = useState<DocumentInfo[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [messages, dispatch] = useReducer(chatReducer, []);
-  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [backendError, setBackendError] = useState<string | null>(null);
   const [speak, setSpeak] = useState(recall("speak") === "1");
-  const [listening, setListening] = useState<"idle" | "recording" | "transcribing">("idle");
-  const [transcript, setTranscript] = useState<string | null>(null);
-
-  const abort = useRef<AbortController | null>(null);
-  const recorder = useRef<Recorder | null>(null);
-  const player = useRef(createPlayer());
-  const speech = useRef({ buffer: "", chain: Promise.resolve(), generation: 0 });
   const scroller = useRef<HTMLDivElement>(null);
 
-  const stt = useVoiceModel(createStt);
-  const tts = useVoiceModel(createTts);
+  const speech = useSpeech(speak);
+  const chat = useChat(speech);
+  const { documents, upload, uploadSample, remove } = useDocuments(setNotice);
+  const dictation = useDictation(setNotice, speech.stop);
+  const { messages, busy } = chat;
 
   const generators = useMemo(
     () => [...(providers?.generators ?? []), ...(nano ? [NANO] : [])],
     [providers, nano],
   );
   const active = generators.find((g) => g.id === provider) ?? generators[0];
-  const busy = messages.some((m) => m.status === "streaming");
   const readyDocs = documents.filter((d) => d.status === "ready");
-
-  // ------------------------------------------------------------ loading
 
   useEffect(() => {
     api
@@ -80,180 +64,17 @@ export default function App() {
     nanoAvailability().then((a) => setNano(a !== "unavailable"));
   }, []);
 
-  const refresh = useCallback(() => api.listDocuments().then(setDocuments).catch(() => {}), []);
-
-  useEffect(() => {
-    void refresh();
-  }, [refresh]);
-
-  useEffect(() => {
-    // Fast while something is being ingested, slow otherwise (uploads from other tabs or the API).
-    const working = documents.some((d) => d.status === "queued" || d.status === "processing");
-    const timer = setInterval(refresh, working ? 700 : 5000);
-    return () => clearInterval(timer);
-  }, [documents, refresh]);
-
   useEffect(() => {
     scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: "smooth" });
   }, [messages]);
 
-  useEffect(() => {
-    if (speak) tts.load();
-  }, [speak, tts]);
-
-  // ------------------------------------------------------------ speech out
-
-  const stopSpeaking = useCallback(() => {
-    speech.current.generation += 1;
-    speech.current.buffer = "";
-    speech.current.chain = Promise.resolve();
-    player.current.stop();
-  }, []);
-
-  const say = useCallback(
-    (sentences: string[]) => {
-      const generation = speech.current.generation;
-      for (const text of sentences) {
-        // Synthesis runs one sentence at a time; playback is scheduled back to back.
-        speech.current.chain = speech.current.chain
-          .then(async () => {
-            if (generation !== speech.current.generation) return;
-            const reply = await tts.request({ type: "speak", text, voice: VOICE });
-            if (reply.type === "audio" && generation === speech.current.generation)
-              void player.current.play(reply.samples, reply.sampleRate);
-          })
-          .catch(() => {});
-      }
-    },
-    [tts],
-  );
-
-  const feedSpeech = useCallback(
-    (text: string, flush = false) => {
-      if (!speak) return;
-      const taken = takeSentences(speech.current.buffer + text, { flush });
-      speech.current.buffer = taken.rest;
-      say(taken.sentences);
-    },
-    [speak, say],
-  );
-
-  // ------------------------------------------------------------ asking
-
-  const handleEvent = useCallback(
-    (id: string, event: AskEvent) => {
-      switch (event.type) {
-        case "sources":
-          return dispatch({ type: "sources", id, hits: event.hits });
-        case "delta":
-          feedSpeech(event.text);
-          return dispatch({ type: "delta", id, text: event.text });
-        case "reset":
-          stopSpeaking();
-          return dispatch({ type: "reset", id });
-        case "done":
-          feedSpeech("", true);
-          return dispatch({ type: "done", id, answer: event.answer, citations: event.citations });
-        case "error":
-          return dispatch({ type: "error", id, message: event.message });
-      }
-    },
-    [feedSpeech, stopSpeaking],
-  );
-
-  const ask = useCallback(
-    async (question: string) => {
-      if (!active) return;
-      stopSpeaking();
-      const id = crypto.randomUUID();
-      const controller = new AbortController();
-      abort.current = controller;
-      const body = {
-        query: question,
-        history: historyOf(messages),
-        document_ids: selected.size ? [...selected] : null,
-      };
-      dispatch({ type: "ask", id, question, provider: active.id });
-      try {
-        if (active.kind === "browser") {
-          const context = await api.getContext(body);
-          handleEvent(id, { type: "sources", hits: context.hits });
-          let answer = "";
-          for await (const delta of nanoStream(context.system, context.user, controller.signal, () => {})) {
-            answer += delta;
-            handleEvent(id, { type: "delta", text: delta });
-          }
-          handleEvent(id, { type: "done", answer, citations: citationsOf(answer, context.hits) });
-        } else {
-          await api.askStream({ ...body, provider: active.id }, (e) => handleEvent(id, e), controller.signal);
-        }
-      } catch (error) {
-        if (controller.signal.aborted) dispatch({ type: "stop", id });
-        else dispatch({ type: "error", id, message: String(error instanceof Error ? error.message : error) });
-      } finally {
-        dispatch({ type: "stop", id });
-      }
-    },
-    [active, messages, selected, handleEvent, stopSpeaking],
-  );
-
-  const stop = () => {
-    abort.current?.abort();
-    stopSpeaking();
+  const ask = (question: string) => {
+    if (active) void chat.ask(question, active, selected.size ? [...selected] : null);
   };
 
-  // ------------------------------------------------------------ speech in
-
-  const toggleMic = async () => {
-    if (listening === "recording" && recorder.current) {
-      const current = recorder.current;
-      recorder.current = null;
-      setListening("transcribing");
-      try {
-        const audio = await decodeToMono16k(await current.stop());
-        const reply = await stt.request({ type: "transcribe", audio });
-        if (reply.type === "text" && reply.text) setTranscript(reply.text);
-      } catch (error) {
-        setUploadError(`Speech recognition failed: ${String(error)}`);
-      } finally {
-        setListening("idle");
-      }
-      return;
-    }
-    stopSpeaking();
-    stt.load();
-    try {
-      recorder.current = await startRecording();
-      setTranscript(null);
-      setListening("recording");
-    } catch {
-      setUploadError("Microphone access was denied.");
-    }
-  };
-
-  // ------------------------------------------------------------ documents
-
-  const upload = async (files: File[], options: api.UploadOptions) => {
-    setUploadError(null);
-    for (const file of files) {
-      try {
-        await api.uploadDocument(file, file.name, options);
-      } catch (error) {
-        setUploadError(`${file.name}: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
-    await refresh();
-  };
-
-  const uploadSample = async () => {
-    const blob = await fetch("/samples/northwind_handbook.pdf").then((r) => r.blob());
-    await upload([new File([blob], "northwind_handbook.pdf", { type: "application/pdf" })], {});
-  };
-
-  const remove = async (id: string) => {
-    await api.deleteDocument(id);
+  const onDelete = async (id: string) => {
+    await remove(id);
     setSelected((s) => new Set([...s].filter((x) => x !== id)));
-    await refresh();
   };
 
   const toggle = (id: string) =>
@@ -266,7 +87,6 @@ export default function App() {
 
   // ------------------------------------------------------------ render
 
-  const micProgress = stt.status === "loading" ? stt.progress : null;
   const placeholder = readyDocs.length
     ? "Ask about your documents…"
     : documents.length
@@ -283,9 +103,9 @@ export default function App() {
         embeddingModel={providers?.embedding_model ?? ""}
         onToggle={toggle}
         onUpload={upload}
-        onDelete={remove}
+        onDelete={(id) => void onDelete(id)}
         onSample={uploadSample}
-        uploadError={uploadError}
+        uploadError={notice}
       />
 
       <main className="main">
@@ -310,7 +130,7 @@ export default function App() {
           </label>
           <div className="topbar-right">
             {messages.length > 0 && (
-              <button className="ghost" onClick={() => dispatch({ type: "clear" })}>
+              <button className="ghost" onClick={chat.clear}>
                 New chat
               </button>
             )}
@@ -320,13 +140,15 @@ export default function App() {
                 const next = !speak;
                 setSpeak(next);
                 remember("speak", next ? "1" : "0");
-                if (!next) stopSpeaking();
+                if (!next) speech.stop();
               }}
               title="Read answers aloud"
             >
               <SpeakerIcon width={16} height={16} />
               <span>
-                {speak && tts.status === "loading" ? `Loading voice ${tts.progress}%` : "Read aloud"}
+                {speak && speech.status === "loading"
+                  ? `Loading voice ${speech.progress}%`
+                  : "Read aloud"}
               </span>
             </button>
           </div>
@@ -350,7 +172,7 @@ export default function App() {
               {readyDocs.some((d) => d.filename.startsWith("northwind")) && (
                 <div className="suggestions">
                   {SUGGESTIONS.map((s) => (
-                    <button key={s} onClick={() => void ask(s)} disabled={busy || !active}>
+                    <button key={s} onClick={() => ask(s)} disabled={busy || !active}>
                       {s}
                     </button>
                   ))}
@@ -372,12 +194,12 @@ export default function App() {
           busy={busy}
           disabled={!readyDocs.length || !active}
           placeholder={placeholder}
-          listening={listening}
-          micProgress={micProgress}
-          transcript={transcript}
-          onSend={(q) => void ask(q)}
-          onStop={stop}
-          onMic={() => void toggleMic()}
+          listening={dictation.listening}
+          micProgress={dictation.progress}
+          transcript={dictation.transcript}
+          onSend={ask}
+          onStop={chat.stop}
+          onMic={() => void dictation.toggle()}
         />
       </main>
     </div>

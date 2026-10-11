@@ -71,12 +71,24 @@ class SearchIn(BaseModel):
     document_ids: list[str] | None = None
 
 
-class ContextIn(SearchIn):
+class RewriteIn(BaseModel):
+    query: str = Field(min_length=1, max_length=2_000)
     history: list[TurnIn] = Field(default_factory=list, max_length=20)
 
 
-class AskIn(ContextIn):
+class AskIn(SearchIn):
+    history: list[TurnIn] = Field(default_factory=list, max_length=20)
     provider: str
+
+
+class ContextIn(SearchIn):
+    history: list[TurnIn] = Field(default_factory=list, max_length=20)
+    rewritten: str | None = Field(default=None, max_length=2_000)  # browser model's rewrite
+
+
+class PromptOut(BaseModel):
+    system: str
+    user: str
 
 
 class ContextOut(BaseModel):

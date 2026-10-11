@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from typing import Any
 
 from raglab.domain import Progress, Prompt, Restart
 from raglab.ports import Report, Stream
@@ -75,3 +76,26 @@ def throttled(
             await report(progress)
 
     return send
+
+
+async def guarded[T](
+    work: Coroutine[Any, Any, T],
+    guard: Coroutine[Any, Any, None],
+    *,
+    lost: Callable[[], Exception],
+) -> T:
+    """Run `work` while `guard` keeps running. If the guard returns first, the work is
+    cancelled and `lost()` is raised; if the guard fails, the work is cancelled and the
+    guard's error is raised. Either way, nothing is left running."""
+    work_task = asyncio.create_task(work)
+    guard_task = asyncio.create_task(guard)
+    try:
+        await asyncio.wait({work_task, guard_task}, return_when=asyncio.FIRST_COMPLETED)
+        if work_task.done():
+            return work_task.result()
+        guard_task.result()
+        raise lost()
+    finally:
+        for task in (work_task, guard_task):
+            task.cancel()
+        await asyncio.gather(work_task, guard_task, return_exceptions=True)

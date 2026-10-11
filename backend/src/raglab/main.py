@@ -10,14 +10,18 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from raglab import worker
 from raglab.api.routes import router
+from raglab.api.security import SameOriginWrites
 from raglab.settings import Settings
 from raglab.wiring import Container, build
 
 FRONTEND_DIST = Path(__file__).resolve().parents[3] / "frontend" / "dist"
+
+log = logging.getLogger("raglab")
 
 type BuildContainer = Callable[[Settings], Awaitable[Container]]
 
@@ -33,6 +37,9 @@ def create_app(settings: Settings, *, build_container: BuildContainer = build) -
             if settings.embedded_worker
             else None
         )
+        if task:
+            task.add_done_callback(_report_worker_exit)
+        app.state.worker = task
         try:
             yield
         finally:
@@ -42,6 +49,8 @@ def create_app(settings: Settings, *, build_container: BuildContainer = build) -
             await container.engine.dispose()
 
     app = FastAPI(title="RAG Lab", lifespan=lifespan)
+    app.add_middleware(SameOriginWrites, allowed=settings.cors_origins)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
@@ -52,6 +61,11 @@ def create_app(settings: Settings, *, build_container: BuildContainer = build) -
     if FRONTEND_DIST.is_dir():
         app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
     return app
+
+
+def _report_worker_exit(task: asyncio.Task[None]) -> None:
+    if not task.cancelled() and (exc := task.exception()):
+        log.error("the ingestion worker stopped; uploads will not be processed", exc_info=exc)
 
 
 def app() -> FastAPI:

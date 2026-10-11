@@ -41,14 +41,16 @@ class Job:
     document_id: str
     options: dict[str, Any]
     attempts: int
+    worker: str
 
 
 class JobCancelled(Exception):
-    """The job is no longer active (its document was deleted or requeued); stop working."""
+    """The job is no longer this worker's: its document was deleted or requeued, or its
+    lease expired and another worker took it. Stop working on it."""
 
 
-def _active(job_id: int) -> Any:
-    return exists().where(jobs.c.id == job_id, jobs.c.status == "running")
+def _owned(job: Job) -> Any:
+    return (jobs.c.id == job.id) & (jobs.c.status == "running") & (jobs.c.worker_id == job.worker)
 
 
 _DOCUMENT_COLUMNS = [c for c in documents.c if c.name not in {"content", "updated_at"}]
@@ -134,7 +136,7 @@ async def set_progress(engine: AsyncEngine, job: Job, progress: Progress) -> Non
     async with engine.begin() as conn:
         result = await conn.execute(
             update(documents)
-            .where(documents.c.id == job.document_id, _active(job.id))
+            .where(documents.c.id == job.document_id, exists().where(_owned(job)))
             .values(
                 progress_stage=progress.stage.value,
                 progress_done=progress.done,
@@ -159,8 +161,8 @@ async def set_document_status(
 # ---------------------------------------------------------------- chunks
 
 
-def make_save_chunks(engine: AsyncEngine, job_id: int | None = None) -> SaveChunks:
-    """Replace a document's chunks. With a job id, only while that job is still active
+def make_save_chunks(engine: AsyncEngine, job: Job | None = None) -> SaveChunks:
+    """Replace a document's chunks. With a job, only while this worker still owns it
     (the row lock keeps a concurrent delete from slipping in between)."""
 
     async def save(
@@ -169,14 +171,10 @@ def make_save_chunks(engine: AsyncEngine, job_id: int | None = None) -> SaveChun
         if len(items) != len(vectors):
             raise ValueError("one vector per chunk is required")
         async with engine.begin() as conn:
-            if job_id is not None:
-                locked = await conn.execute(
-                    select(jobs.c.id)
-                    .where(jobs.c.id == job_id, jobs.c.status == "running")
-                    .with_for_update()
-                )
+            if job is not None:
+                locked = await conn.execute(select(jobs.c.id).where(_owned(job)).with_for_update())
                 if locked.first() is None:
-                    raise JobCancelled(job_id)
+                    raise JobCancelled(job.id)
             await conn.execute(delete(chunks).where(chunks.c.document_id == document_id))
             if items:
                 await conn.execute(
@@ -232,7 +230,10 @@ def make_vector_search(engine: AsyncEngine, model: str) -> VectorSearch:
     )
 
     async def search(vector: Vector, k: int, ids: Sequence[str] | None) -> list[Hit]:
-        async with engine.connect() as conn:
+        async with engine.begin() as conn:
+            # The HNSW index filters after its scan; without this, scoping the search to a
+            # few documents can return fewer than k rows once the index is used.
+            await conn.execute(text("SET LOCAL hnsw.iterative_scan = strict_order"))
             rows = await conn.execute(
                 sql,
                 {
@@ -272,38 +273,62 @@ def make_text_search(engine: AsyncEngine) -> TextSearch:
 # ---------------------------------------------------------------- jobs
 
 
-async def claim_job(engine: AsyncEngine) -> Job | None:
+def _lease(seconds: float) -> Any:
+    return func.now() + func.make_interval(0, 0, 0, 0, 0, 0, seconds)
+
+
+async def claim_job(engine: AsyncEngine, worker: str, *, lease_seconds: float) -> Job | None:
     """Take the oldest pending job. SKIP LOCKED lets several workers share the queue."""
     async with engine.begin() as conn:
         row = (
             await conn.execute(
                 text(
                     """
-                    UPDATE jobs SET status = 'running', attempts = attempts + 1, updated_at = now()
+                    UPDATE jobs SET status = 'running', attempts = attempts + 1,
+                        worker_id = :worker, lease_until = now() + make_interval(secs => :lease),
+                        updated_at = now()
                     WHERE id = (
                         SELECT id FROM jobs WHERE status = 'pending'
                         ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1
                     )
                     RETURNING id, document_id, options, attempts
                     """
-                )
+                ),
+                {"worker": worker, "lease": lease_seconds},
             )
         ).first()
         if row is None:
             return None
         await set_document_status(conn, row.document_id, DocumentStatus.PROCESSING, **_NO_PROGRESS)
-        return Job(row.id, row.document_id, dict(row.options), row.attempts)
+        return Job(row.id, row.document_id, dict(row.options), row.attempts, worker)
+
+
+async def renew_lease(engine: AsyncEngine, job: Job, *, lease_seconds: float) -> bool:
+    """Extend the lease; False once the job is no longer this worker's."""
+    async with engine.begin() as conn:
+        renewed = await conn.execute(
+            update(jobs)
+            .where(_owned(job))
+            .values(lease_until=_lease(lease_seconds))
+            .returning(jobs.c.id)
+        )
+        return renewed.first() is not None
 
 
 async def finish_job(
     engine: AsyncEngine, job: Job, *, error: str | None, document_fields: dict[str, Any]
 ) -> None:
-    """Close the job and update its document, unless the job was cancelled meanwhile."""
+    """Close the job and update its document, unless the job is no longer this worker's."""
     async with engine.begin() as conn:
         closed = await conn.execute(
             update(jobs)
-            .where(jobs.c.id == job.id, jobs.c.status == "running")
-            .values(status="failed" if error else "done", error=error, updated_at=func.now())
+            .where(_owned(job))
+            .values(
+                status="failed" if error else "done",
+                error=error,
+                lease_until=None,
+                updated_at=func.now(),
+            )
             .returning(jobs.c.id)
         )
         if closed.first() is None:
@@ -314,22 +339,84 @@ async def finish_job(
         )
 
 
+async def _queue(conn: AsyncConnection, document_id: str, options: dict[str, Any]) -> None:
+    await conn.execute(
+        update(jobs)
+        .where(jobs.c.document_id == document_id, jobs.c.status.in_(["pending", "running"]))
+        .values(status="cancelled", lease_until=None, updated_at=func.now())
+    )
+    await conn.execute(insert(jobs).values(document_id=document_id, options=options))
+    await set_document_status(conn, document_id, DocumentStatus.QUEUED, error=None)
+
+
 async def requeue(engine: AsyncEngine, document_id: str, options: dict[str, Any]) -> None:
     """Queue a fresh ingestion; any open job for the document is cancelled (and stops)."""
     async with engine.begin() as conn:
-        await conn.execute(
-            update(jobs)
-            .where(jobs.c.document_id == document_id, jobs.c.status.in_(["pending", "running"]))
-            .values(status="cancelled", updated_at=func.now())
-        )
-        await conn.execute(insert(jobs).values(document_id=document_id, options=options))
-        await set_document_status(conn, document_id, DocumentStatus.QUEUED, error=None)
+        await _queue(conn, document_id, options)
 
 
-async def recover_running_jobs(engine: AsyncEngine) -> int:
-    """Jobs left 'running' by a crashed worker go back to the queue."""
+async def recover_expired_jobs(engine: AsyncEngine, *, max_attempts: int) -> int:
+    """Jobs whose worker stopped renewing the lease (crash, kill, lost connection) go back
+    to the queue, or fail once they have used all their attempts."""
+    expired = (jobs.c.status == "running") & (
+        jobs.c.lease_until.is_(None) | (jobs.c.lease_until < func.now())
+    )
+    give_up = f"Stopped {max_attempts} times while processing this document; not retrying."
     async with engine.begin() as conn:
-        result = await conn.execute(
-            update(jobs).where(jobs.c.status == "running").values(status="pending")
+        retried = (
+            (
+                await conn.execute(
+                    update(jobs)
+                    .where(expired, jobs.c.attempts < max_attempts)
+                    .values(
+                        status="pending", worker_id=None, lease_until=None, updated_at=func.now()
+                    )
+                    .returning(jobs.c.document_id)
+                )
+            )
+            .scalars()
+            .all()
         )
-        return result.rowcount
+        for document_id in retried:
+            await set_document_status(conn, document_id, DocumentStatus.QUEUED, **_NO_PROGRESS)
+        failed = (
+            (
+                await conn.execute(
+                    update(jobs)
+                    .where(expired)
+                    .values(status="failed", error=give_up, lease_until=None, updated_at=func.now())
+                    .returning(jobs.c.document_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for document_id in failed:
+            await set_document_status(
+                conn, document_id, DocumentStatus.FAILED, error=give_up, **_NO_PROGRESS
+            )
+    return len(retried) + len(failed)
+
+
+async def requeue_stale_embeddings(engine: AsyncEngine, model: str) -> int:
+    """Documents embedded with another model are invisible to vector search; ingest them
+    again with the options of their last job."""
+    async with engine.begin() as conn:
+        rows = await conn.execute(
+            text(
+                """
+                SELECT DISTINCT ON (j.document_id) j.document_id, j.options
+                FROM jobs j JOIN documents d ON d.id = j.document_id
+                WHERE d.status = 'ready' AND EXISTS (
+                    SELECT 1 FROM chunks c
+                    WHERE c.document_id = d.id AND c.embedding_model <> :model
+                )
+                ORDER BY j.document_id, j.id DESC
+                """
+            ),
+            {"model": model},
+        )
+        stale = [(row.document_id, dict(row.options)) for row in rows]
+        for document_id, options in stale:
+            await _queue(conn, document_id, options)
+    return len(stale)

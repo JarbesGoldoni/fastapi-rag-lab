@@ -14,9 +14,11 @@ from raglab.api.schemas import (
     ContextOut,
     DocumentOut,
     HitOut,
+    PromptOut,
     ProviderOut,
     ProvidersOut,
     ReprocessIn,
+    RewriteIn,
     SearchIn,
     citation_out,
     context_out,
@@ -25,12 +27,10 @@ from raglab.api.schemas import (
     turns,
 )
 from raglab.core.events import sse
-from raglab.core.prompts import answer_prompt
-from raglab.core.retrieval import within_budget
+from raglab.core.prompts import rewrite_prompt
 from raglab.core.text import document_id
-from raglab.db import repository as repo
 from raglab.domain import RawDocument
-from raglab.pipelines.ask import Delta, Done, Reset, Sources, ask
+from raglab.pipelines.ask import Delta, Done, Reset, Sources
 from raglab.wiring import Container
 
 router = APIRouter(prefix="/api")
@@ -60,8 +60,10 @@ def _job_options(
 
 
 @router.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health(request: Request) -> dict[str, str]:
+    task = request.app.state.worker
+    worker = "external" if task is None else "stopped" if task.done() else "running"
+    return {"status": "ok" if worker != "stopped" else "degraded", "worker": worker}
 
 
 @router.get("/providers")
@@ -79,7 +81,7 @@ async def providers(c: Dep) -> ProvidersOut:
 
 @router.get("/documents")
 async def list_documents(c: Dep) -> list[DocumentOut]:
-    return [document_out(row) for row in await repo.list_documents(c.engine)]
+    return [document_out(row) for row in await c.list_documents()]
 
 
 @router.post("/documents", status_code=202)
@@ -90,17 +92,15 @@ async def upload(
     contextualize_with: Annotated[str | None, Form()] = None,
     ai_extraction: Annotated[str | None, Form()] = None,
 ) -> DocumentOut:
-    content = await file.read()
-    if len(content) > c.settings.max_upload_mb * 1024 * 1024:
+    if (file.size or 0) > c.settings.max_upload_mb * 1024 * 1024:
         raise HTTPException(413, f"Files up to {c.settings.max_upload_mb} MB")
+    content = await file.read()
     if not content.startswith(b"%PDF"):
         raise HTTPException(415, "Only PDF files are supported")
     doc = RawDocument(
         id=document_id(content), filename=file.filename or "document.pdf", content=content
     )
-    row, created = await repo.create_document(
-        c.engine, doc, _job_options(c, contextualize_with, ai_extraction)
-    )
+    row, created = await c.add_document(doc, _job_options(c, contextualize_with, ai_extraction))
     if not created:
         response.status_code = 200
     return document_out(row)
@@ -108,7 +108,7 @@ async def upload(
 
 @router.get("/documents/{doc_id}")
 async def get_document(c: Dep, doc_id: str) -> DocumentOut:
-    row = await repo.get_document(c.engine, doc_id)
+    row = await c.get_document(doc_id)
     if row is None:
         raise HTTPException(404, "Document not found")
     return document_out(row)
@@ -116,7 +116,7 @@ async def get_document(c: Dep, doc_id: str) -> DocumentOut:
 
 @router.get("/documents/{doc_id}/file")
 async def get_file(c: Dep, doc_id: str) -> Response:
-    doc = await repo.get_raw_document(c.engine, doc_id)
+    doc = await c.get_file(doc_id)
     if doc is None:
         raise HTTPException(404, "Document not found")
     return Response(
@@ -128,19 +128,15 @@ async def get_file(c: Dep, doc_id: str) -> Response:
 
 @router.post("/documents/{doc_id}/reprocess", status_code=202)
 async def reprocess(c: Dep, doc_id: str, body: ReprocessIn) -> DocumentOut:
-    if await repo.get_document(c.engine, doc_id) is None:
+    row = await c.reprocess(doc_id, _job_options(c, body.contextualize_with, body.ai_extraction))
+    if row is None:
         raise HTTPException(404, "Document not found")
-    await repo.requeue(
-        c.engine, doc_id, _job_options(c, body.contextualize_with, body.ai_extraction)
-    )
-    row = await repo.get_document(c.engine, doc_id)
-    assert row is not None
     return document_out(row)
 
 
 @router.delete("/documents/{doc_id}", status_code=204)
 async def delete_document(c: Dep, doc_id: str) -> None:
-    if not await repo.delete_document(c.engine, doc_id):
+    if not await c.delete_document(doc_id):
         raise HTTPException(404, "Document not found")
 
 
@@ -150,14 +146,24 @@ async def search(c: Dep, body: SearchIn) -> list[HitOut]:
     return [hit_out(h) for h in hits]
 
 
+@router.post("/rewrite-prompt")
+async def rewrite(body: RewriteIn) -> PromptOut:
+    """For browser models: the prompt that turns a follow-up into a standalone query."""
+    prompt = rewrite_prompt(body.query, turns(body.history))
+    return PromptOut(system=prompt.system, user=prompt.user)
+
+
 @router.post("/context")
 async def context(c: Dep, body: ContextIn) -> ContextOut:
     """Retrieval and prompt only. The browser runs the model (Chrome's built-in Gemini Nano)."""
-    hits = within_budget(
-        await c.search(body.query, k=body.k, document_ids=body.document_ids),
-        max_chars=4_000,  # the on-device model has a small context window
+    hits, prompt = await c.browser_context(
+        body.query,
+        rewritten=body.rewritten,
+        history=turns(body.history),
+        k=body.k,
+        document_ids=body.document_ids,
     )
-    return context_out(hits, answer_prompt(body.query, hits, turns(body.history)))
+    return context_out(hits, prompt)
 
 
 @router.post("/ask")
@@ -165,12 +171,15 @@ async def ask_stream(c: Dep, body: AskIn) -> StreamingResponse:
     generator = c.providers.generators.get(body.provider)
     if generator is None:
         raise HTTPException(422, f"Provider not available: {body.provider}")
-    hits = await c.search(body.query, k=body.k, document_ids=body.document_ids)
 
     async def events() -> AsyncIterator[bytes]:
         try:
-            async for event in ask(
-                body.query, hits, generator=generator, history=turns(body.history)
+            async for event in c.answer(
+                body.query,
+                generator=generator,
+                history=turns(body.history),
+                k=body.k,
+                document_ids=body.document_ids,
             ):
                 match event:
                     case Sources(hits=selected):
