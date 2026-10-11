@@ -1,0 +1,19 @@
+# Postgres 17 with pgvector. The API runs on the host (it needs your claude/codex login).
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: raglab
+      POSTGRES_PASSWORD: raglab
+      POSTGRES_DB: raglab
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U raglab"]
+      interval: 2s
+      retries: 20
+
+volumes:
+  pgdata:

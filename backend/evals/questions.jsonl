@@ -1,0 +1,22 @@
+{"question": "Can I deploy to production on a Friday evening?", "page": 2}
+{"question": "How much traffic does the canary get and for how long?", "page": 2}
+{"question": "When is a canary rolled back automatically?", "page": 2}
+{"question": "Why are deploys frozen at the end of the month?", "page": 2}
+{"question": "When does the on-call week start?", "page": 3}
+{"question": "How fast must the primary on-call acknowledge a page?", "page": 3}
+{"question": "Do on-call engineers get time off for weekends?", "page": 3}
+{"question": "What happens if the primary does not acknowledge?", "page": 3}
+{"question": "What counts as a severity one incident?", "page": 4}
+{"question": "How often are updates posted during an incident?", "page": 4}
+{"question": "When is the postmortem due?", "page": 4}
+{"question": "How long after capture can a card payment be refunded?", "page": 5}
+{"question": "What does the Idempotency-Key header do on refunds?", "page": 5}
+{"question": "Which webhook tells me a refund finished?", "page": 5}
+{"question": "What is the API rate limit per merchant?", "page": 6}
+{"question": "What status code do I get when I exceed the limit?", "page": 6}
+{"question": "How many times do internal services retry?", "page": 6}
+{"question": "For how long are webhooks retried?", "page": 6}
+{"question": "Where are card numbers stored?", "page": 7}
+{"question": "How do engineers get access to the production database?", "page": 7}
+{"question": "How long is merchant data kept after the contract ends?", "page": 7}
+{"question": "Which cloud and regions does the platform run on?", "page": 1}
